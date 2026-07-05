@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SATrainer</title>
+  <link rel="stylesheet" href="css/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="app">
+      <div>
+        <h1>SATrainer</h1>
+        <div class="sub">Digital SAT · evaluate → train → re-evaluate</div>
+      </div>
+      <nav class="nav">
+        <button data-route="dashboard" class="active">Loop</button>
+        <button data-route="skills">Skills</button>
+        <button data-route="help">Data &amp; Help</button>
+      </nav>
+    </header>
+
+    <div class="section-switch" id="sectionSwitch">
+      <button data-section="rw">Reading &amp; Writing</button>
+      <button data-section="math">Math</button>
+    </div>
+
+    <main id="view"><!-- rendered by app.js --></main>
+
+    <footer class="app">
+      Runs entirely offline · progress saved in this browser · no account, no server
+    </footer>
+  </div>
+
+  <!-- Classic scripts, loaded in dependency order so it works from file:// -->
+  <script src="js/questions.js"></script>
+  <script src="js/exam_rw.js"></script>
+  <script src="js/math_questions.js"></script>
+  <script src="js/exam_math.js"></script>
+  <script src="js/storage.js"></script>
+  <script src="js/mastery.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

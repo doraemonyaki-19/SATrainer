@@ -1,0 +1,48 @@
+{
+  "name": "satrainer",
+  "productName": "SATrainer",
+  "version": "1.0.0",
+  "description": "Offline Digital SAT trainer with an evaluate → train → re-evaluate loop.",
+  "author": "SATrainer",
+  "license": "MIT",
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --mac",
+    "dist:universal": "electron-builder --mac --universal",
+    "dist:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^31.7.6",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "org.biomemsrc.satrainer",
+    "productName": "SATrainer",
+    "files": [
+      "index.html",
+      "electron-main.js",
+      "css/**",
+      "js/**",
+      "assets/**"
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.education"
+    },
+    "dmg": {
+      "title": "SATrainer"
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    }
+  }
+}
