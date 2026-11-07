@@ -1,7 +1,7 @@
 /*
  * SATrainer — UI and routing (section-aware).
- * Depends on: questions.js/generators.js (SAT_TAXONOMY, SAT_QUESTIONS),
- *             math_questions.js/math_generators.js (MATH_TAXONOMY, MATH_QUESTIONS),
+ * Depends on: questions.js + exam_rw.js (SAT_TAXONOMY, SAT_QUESTIONS),
+ *             math_questions.js + exam_math.js (MATH_TAXONOMY, MATH_QUESTIONS),
  *             storage.js (Store), mastery.js (Engine).
  */
 
@@ -186,8 +186,27 @@
   // =======================================================================
   let quiz = null;
 
+  // Hand-written questions were authored with the key mostly in slot A/B, so
+  // shuffle their text choices per presentation (keeping answer + rationales
+  // aligned). Real exam items keep the official order: their explanations and
+  // images refer to the printed letters.
+  function presentable(q) {
+    if (q.exam || q.type === "spr" || !Array.isArray(q.choices)) return q;
+    const order = q.choices.map((_, i) => i);
+    for (let i = order.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    return {
+      ...q,
+      choices: order.map((i) => q.choices[i]),
+      rationales: q.rationales ? order.map((i) => q.rationales[i]) : q.rationales,
+      answer: order.indexOf(q.answer),
+    };
+  }
+
   function launchQuiz(opts) {
-    const questions = Engine.buildQuiz(prog(), tax(), pool(), opts);
+    const questions = Engine.buildQuiz(prog(), tax(), pool(), opts).map(presentable);
     if (questions.length === 0) { alert("No questions available for that selection yet."); return; }
     quiz = { questions, idx: 0, results: [], mode: opts.mode, title: opts.title || "Practice" };
     renderQuestion();
@@ -205,7 +224,7 @@
         ]),
         el("div", { class: "progress-track" }, [el("span", { style: `width:${(quiz.idx / n) * 100}%` })]),
         ...stimulus(q),
-        q.type === "spr" ? buildSpr(q) : q.image ? buildImageChoices(q) : buildChoices(q),
+        q.type === "spr" ? buildSpr(q) : q.choices ? buildChoices(q) : buildImageChoices(q),
         el("div", { id: "feedback" }),
       ]),
     ]);
@@ -214,15 +233,30 @@
     if (q.type === "spr") { const inp = document.getElementById("sprInput"); if (inp) inp.focus(); }
   }
 
+  // Passage text may mark underlined portions as <u>…</u>. Build real nodes
+  // (never innerHTML) so passage text can't inject markup.
+  function richText(text) {
+    const out = [];
+    const parts = String(text).split(/(<u>|<\/u>)/);
+    let underline = false;
+    for (const part of parts) {
+      if (part === "<u>") underline = true;
+      else if (part === "</u>") underline = false;
+      else if (part) out.push(underline ? el("u", {}, part) : part);
+    }
+    return out;
+  }
+
   function stimulus(q) {
     if (q.image) {
+      // The image holds the full stem (passage + figure/table + question).
       const out = [el("img", { class: "qimage", src: q.image, alt: "SAT question" })];
       if (q.type === "spr")
         out.push(el("div", { class: "spr-note" }, "Student-produced response — enter your answer below."));
       return out;
     }
     const out = [];
-    if (q.passage) out.push(el("div", { class: "passage" }, q.passage));
+    if (q.passage) out.push(el("div", { class: "passage" }, richText(q.passage)));
     if (q.prompt) out.push(el("div", { class: "prompt" }, q.prompt));
     return out;
   }
@@ -278,25 +312,49 @@
         }),
         el("button", { class: "btn", id: "sprSubmit", onclick: submit }, "Submit"),
       ]),
-      el("div", { class: "spr-hint" }, "Type a number or a fraction (e.g. 3/2). Decimals like 1.5 are accepted."),
+      el("div", { class: "spr-hint" }, "Type a number, decimal, or fraction (e.g. 3/2, 1.5, .75, -4)."),
     ]);
   }
 
-  // --- SPR grading: accept listed forms, or numeric equivalence ---
+  // --- SPR grading (Digital SAT student-produced-response rules) ---
+  // Accepts integers, decimals (incl. ".5", "-.5"), fractions ("7/24"), and
+  // thousands separators ("2,850"). A decimal that doesn't fit the grid may be
+  // truncated or rounded as long as it fills it (5 characters, 6 with a minus
+  // sign): for 2/3, ".6666", ".6667", "0.666", "0.667" are right, ".67" is not.
+  const NUM = String.raw`-?(?:\d+(?:\.\d*)?|\.\d+)`;
+  function normalizeEntry(s) {
+    return String(s).replace(/\s+/g, "").replace(/[−–]/g, "-").replace(/,(?=\d{3}\b)/g, "");
+  }
   function parseNumeric(s) {
-    s = s.replace(/\s+/g, "");
-    if (/^-?\d+(\.\d+)?$/.test(s)) return parseFloat(s);
-    const m = s.match(/^(-?\d+(?:\.\d+)?)\/(-?\d+(?:\.\d+)?)$/);
+    s = normalizeEntry(s);
+    if (new RegExp(`^${NUM}$`).test(s)) return parseFloat(s);
+    const m = s.match(new RegExp(`^(${NUM})/(${NUM})$`));
     if (m) { const d = parseFloat(m[2]); if (d !== 0) return parseFloat(m[1]) / d; }
     return null;
   }
+  function sprAnswers(q) {
+    return Array.isArray(q.answers) && q.answers.length ? q.answers : [q.answer];
+  }
+  function matchesValue(entry, val, target) {
+    if (Math.abs(val - target) < 1e-9 * Math.max(1, Math.abs(target))) return true;
+    const dec = entry.match(/^-?\d*\.(\d+)$/);
+    if (!dec) return false;
+    const width = entry.replace(/^-/, "").length;
+    // Only a grid-filling decimal may be an approximation (truncated/rounded).
+    return width >= 5 && Math.abs(val - target) < Math.pow(10, -dec[1].length);
+  }
+  // Returns true/false, or null when there is nothing gradable to submit.
   function checkSpr(raw, q) {
-    const norm = (raw || "").trim();
-    if (!norm) return false;
-    if (q.accept && q.accept.map((a) => a.trim()).includes(norm)) return true;
-    const val = parseNumeric(norm);
-    if (val == null) return false;
-    return Math.abs(val - q.answer) < 1e-6;
+    const entry = normalizeEntry(raw || "");
+    if (!entry) return null;
+    if (q.accept && q.accept.map(normalizeEntry).includes(entry)) return true;
+    const val = parseNumeric(entry);
+    if (val == null) return null;
+    return sprAnswers(q).some((t) => matchesValue(entry, val, t));
+  }
+  function sprAnswerText(q) {
+    if (q.answerText) return q.answerText;
+    return q.accept && q.accept.length ? q.accept[0] : String(q.answer);
   }
 
   function recordAndTally(q, isCorrect) {
@@ -336,10 +394,18 @@
 
   function answerSPR(q, raw) {
     const isCorrect = checkSpr(raw, q);
+    const inp = document.getElementById("sprInput");
+    if (isCorrect === null) {
+      // Empty or not a number: don't count it as a wrong answer.
+      const hint = document.querySelector(".spr-hint");
+      if (hint) { hint.textContent = "Enter a number, decimal, or fraction (e.g. 3/2, .75, -4) before submitting."; hint.classList.add("warn"); }
+      if (inp) inp.focus();
+      return;
+    }
     recordAndTally(q, isCorrect);
-    const inp = document.getElementById("sprInput"); if (inp) inp.disabled = true;
+    if (inp) inp.disabled = true;
     const btn = document.getElementById("sprSubmit"); if (btn) btn.disabled = true;
-    const shown = q.accept && q.accept.length ? q.accept[0] : String(q.answer);
+    const shown = sprAnswerText(q);
     const parts = [el("div", { class: "rationale " + (isCorrect ? "ok" : "no") }, [
       el("div", { class: "verdict" }, isCorrect ? "Correct" : `Not quite — the answer is ${shown}`),
       explanationNode(q),

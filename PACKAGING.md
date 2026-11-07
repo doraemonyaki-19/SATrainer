@@ -76,7 +76,8 @@ to the `build.mac` section of `package.json` (not required for personal use).
 ## What's in the package
 
 - `index.html`, `css/`, `js/` — the app.
-- `assets/math/` — ~800 PNGs (real exam math question + explanation images).
+- `assets/math/` (~860 PNGs: real exam math questions + explanation images) and
+  `assets/rw/` (R&W table/graph stimulus images).
   **Required**; the app references them by relative path. Keep them with the app.
 - `electron-main.js`, `package.json` — Electron wrapper + build config.
 - `SATrainer.command` — the no-build launcher.

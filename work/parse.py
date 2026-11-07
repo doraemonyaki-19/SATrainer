@@ -18,7 +18,9 @@ NOISE = [
     r"^CONTINUE\s*$", r"^STOP\s*$", r"^DIRECTIONS\s*$",
     r"^Module\s*$", r"^\s*$",
     r"^===PAGE \d+===$",
-    r"^\.{5,}.*$", r"^-{3,}.*$", r"^_{3,}.*$",
+    # Rule/leader lines only. (A line that merely *starts* with a blank, e.g.
+    # "_______ tug-of-war as an official Olympic event!", is content.)
+    r"^\.{5,}.*$", r"^-{3,}.*$", r"^_{3,}\s*$",
     r"^The questions in this section.*$",
     r"^Read each passage.*$", r"^All questions in this section.*$",
     r"^single best answer.*$", r"^and question carefully.*$",
@@ -124,6 +126,21 @@ def parse_region_questions(region_text):
         blocks[N] = lines[i + 1:end]
     return blocks
 
+def _spaced(word):
+    return r"\s*".join(re.escape(c) for c in word)
+
+START_REF_RE = re.compile(
+    _spaced("Start") + r"\s+" + _spaced("referenced") + r"\s+" + _spaced("content") + r"\s*:?",
+    re.I)
+END_REF_RE = re.compile(
+    _spaced("End") + r"\s+" + _spaced("referenced") + r"\s+" + _spaced("content") + r"\s*[.:]?",
+    re.I)
+
+# Module-end boilerplate that the last question's final choice swallows.
+CHOICE_TAIL_RE = re.compile(
+    r"\s*(If you finish before time is called|No Test Material On This Page|"
+    r"Reading and Writing \d+ QUESTIONS|Math \d+ QUESTIONS).*$", re.S)
+
 CHOICE_RE = re.compile(r"(?m)^\s*([ABCD])\)\s?(.*)$")
 STEM_RE = re.compile(
     r"(Which choice|Which finding|Which quotation|Which statement|"
@@ -143,9 +160,17 @@ def parse_block(raw_lines):
         kept.append(s)
     text = "\n".join(kept)
     # Strip accessibility annotations that mark underlined portions.
-    text = text.replace("Start referenced Content:", "").replace("End referenced Content", "")
-    text = re.sub(r"(?<=[a-z])blank\b", " ______ ", text)  # glued, e.g. "beblank"
-    text = re.sub(r"\bblank\b", " ______ ", text)
+    # Accessibility markers around underlined portions -> <u>…</u> (rendered by
+    # the app as underline). The text layer sometimes splits the words
+    # ("Conte nt"), so allow whitespace between letters.
+    text = START_REF_RE.sub(" <u>", text)
+    text = END_REF_RE.sub("</u> ", text)
+    text = re.sub(r"\bb\s?l\s?a\s?n\s?k\b", " ______ ", text)  # "b l a n k", "b lan\nk"
+    text = re.sub(r"(?<=[A-Za-z])blank\b", " ______ ", text)  # glued, e.g. "USblank"
+    text = re.sub(r"\b(?:blank|BLANK)\b", " ______ ", text)
+    # Decorative rules in the PDF extract as runs of dash/tilde-only tokens.
+    text = re.sub(r"(?m)(?:(?<=\s)|^)[-~]+(?:[ \t]+[-~]+)+(?=\s|$)", " ", text)
+    text = re.sub(r"(?m)(?:(?<=\s)|^)[-~]{3,}(?=\s|$)", " ", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{2,}", "\n", text).strip()
 
@@ -160,7 +185,7 @@ def parse_block(raw_lines):
             letter = m.group(1)
             start = m.start(2)  # start of the choice text (after "A) ")
             end = cm[i + 1].start() if i + 1 < len(cm) else len(text)
-            choices[letter] = " ".join(text[start:end].split()).strip()
+            choices[letter] = CHOICE_TAIL_RE.sub("", " ".join(text[start:end].split())).strip()
     # Split stem_area into passage + prompt (last ?-terminated sentence).
     prompt, passage = stem_area, ""
     # find last sentence ending in ?
@@ -189,6 +214,11 @@ def parse_block(raw_lines):
         "type": "mc" if has_all else "spr",
     }
 
+def well_formed(pb):
+    """Passage/prompt/choices split cleanly: a question sentence and A-D."""
+    return bool(pb["choices"]) and pb["prompt"].rstrip().endswith("?")
+
+
 def parse_main(path):
     text = full_text(path)
     out = {}
@@ -197,6 +227,26 @@ def parse_main(path):
         for num, raw in blocks.items():
             pb = parse_block(raw)
             out[(sec, module, num)] = pb
+    # Two-column text extraction scrambles some pages (questions missed, or
+    # directions text glued into choices). For R&W, prefer each question's own
+    # label-delimited region (see layout.py), which is never scrambled across
+    # columns; keep the text-flow parse only as a fallback.
+    import layout as L
+    doc = fitz.open(path)
+    for module in (1, 2):
+        flow = L.ModuleFlow(doc, "rw", module)
+        for num in flow.numbers():
+            key = ("rw", module, num)
+            pieces, _ = split_trailing_figure(doc, flow.pieces(num))
+            cands = [parse_block(question_text(flow, doc, pieces, s).split("\n"))
+                     for s in (False, True)]
+            good = [pb for pb in cands if well_formed(pb)]
+            if good:
+                out[key] = good[0]
+            elif not (key in out and well_formed(out[key])) and cands[0]["choices"]:
+                # No question sentence in the text layer at all (drawn as
+                # graphics); the stem is shown as an image, choices stay text.
+                out[key] = cands[0]
     return out
 
 # ---------------------------------------------------------------------------
@@ -208,39 +258,42 @@ SPR_RE = re.compile(r"The correct answer is\s+(.+?)\.")
 CHOICE_INCORRECT_RE = re.compile(r"Choice ([ABCD]) is incorrect")
 
 def parse_answers(path):
+    """Split the answer key into QUESTION blocks keyed by (section, module, N).
+
+    The "MATH: MODULE 2" style header is a running page header, and on some pages
+    the text layer emits it *after* the first questions -- so the section/module
+    is taken per page (from anywhere on the page), not from line order.
+    """
     pages = read_pages(path)
-    text = "\n".join(pages)
-    lines = text.split("\n")
-    # Determine module region for each line by scanning headers.
-    out = {}
-    cur_sec, cur_mod = None, None
-    # Rebuild by splitting on "QUESTION N" markers while tracking section/module.
-    # First, find section/module transitions with their line indices.
-    joined = text
-    # Split by QUESTION markers, but we need section context; do a linear pass.
-    idx = 0
     blocks = []  # (sec, mod, num, block_text)
-    cur = None
-    curkey = None
+    cur, curkey = None, None
+    seen = set()
     def flush():
         if cur is not None and curkey is not None:
+            if curkey in seen:
+                print(f"  !! duplicate answer block {curkey} in {path}")
+            seen.add(curkey)
             blocks.append((curkey[0], curkey[1], curkey[2], "\n".join(cur)))
-    for ln in lines:
-        h = ANS_SEC_RE.search(ln)
+    for page in pages:
+        h = ANS_SEC_RE.search(page)
+        page_sec = page_mod = None
         if h:
-            cur_sec = "rw" if "READING" in h.group(1) else "math"
-            cur_mod = int(h.group(2))
-            continue
-        qm = re.fullmatch(r"QUESTION (\d+)", ln.strip())
-        if qm and cur_sec:
-            flush()
-            cur = []
-            curkey = (cur_sec, cur_mod, int(qm.group(1)))
-            continue
-        if cur is not None:
-            cur.append(ln)
+            page_sec = "rw" if "READING" in h.group(1) else "math"
+            page_mod = int(h.group(2))
+        for ln in page.split("\n"):
+            if ANS_SEC_RE.search(ln):
+                continue
+            qm = re.fullmatch(r"QUESTION (\d+)", ln.strip())
+            if qm and page_sec:
+                flush()
+                cur = []
+                curkey = (page_sec, page_mod, int(qm.group(1)))
+                continue
+            if cur is not None:
+                cur.append(ln)
     flush()
 
+    out = {}
     for sec, mod, num, btext in blocks:
         bt = clean_symbols(" ".join(btext.split()))
         letter = None
@@ -261,6 +314,22 @@ def parse_answers(path):
 
 MARK_RE = re.compile(r"Choice ([ABCD]) is (?:the best answer|correct|incorrect)")
 
+# Running page footer of the answer PDFs ("n 3 SAT PRACTICE TEST #4 ANSWER
+# EXPLANATIONS") and the next section's heading leak into explanation text.
+RAT_FOOTER_RE = re.compile(r"\s*(?:\bn\s+)?\d+\s+SAT PRACTICE TEST #\d+ ANSWER EXPLANATIONS\.?")
+RAT_TAIL_RE = re.compile(r"\s*(?:Reading and Writing|Math) Module \d \(\d+ questions\)\.?\s*$")
+
+
+def clean_rationale(seg):
+    seg = RAT_FOOTER_RE.sub(" ", seg)
+    seg = RAT_TAIL_RE.sub("", seg)
+    seg = " ".join(seg.split())
+    seg = re.sub(r"^\s*because\s*", "", seg)
+    seg = re.sub(r"^[\s.,;:]+", "", seg)   # "Choice B is incorrect. The …" -> "The …"
+    seg = seg.strip().rstrip(".") + "."
+    return seg[:1].upper() + seg[1:]
+
+
 def extract_rationales(bt):
     ms = list(MARK_RE.finditer(bt))
     rats = {}
@@ -269,8 +338,7 @@ def extract_rationales(bt):
         start = m.end()
         end = ms[i + 1].start() if i + 1 < len(ms) else len(bt)
         seg = bt[start:end]
-        seg = re.sub(r"^\s*because\s*", "", seg).strip()
-        seg = seg.strip().rstrip(".") + "."
+        seg = clean_rationale(seg)
         if L not in rats:  # keep first mention
             rats[L] = seg
     return rats
@@ -289,6 +357,9 @@ def infer_skill(prompt, passage, choices):
     pa = " ".join((passage or "").split()).lower()
     if "most logical transition" in p:
         return "transitions"
+    if "?" not in p and choices and all(len(c.split()) <= 2 for c in choices.values()):
+        # Prompt missing from the text layer; one/two-word options = vocabulary.
+        return "words-in-context"
     if "precise word or phrase" in p or "most logical and precise word" in p:
         return "words-in-context"
     if "conventions of standard english" in p:
@@ -321,11 +392,133 @@ def infer_skill(prompt, passage, choices):
 LETTER_IDX = {"A": 0, "B": 1, "C": 2, "D": 3}
 
 def clean_passage(passage):
-    if "•" in passage:
-        return "\n".join(" ".join(l.split()) for l in passage.split("\n") if l.strip())
-    return " ".join(passage.split())
+    p = " ".join(passage.split())  # undo the PDF's hard line wraps
+    p = re.sub(r"\s+</u>", "</u>", re.sub(r"<u>\s+", "<u>", p))
+    p = re.sub(r"(?:______\s*){2,}", "______ ", p).strip()  # "blank" + its alt text
+    p = re.sub(r"______\s+([:;,.!?])", r"______\1", p)
+    if "•" in p:
+        # Student notes: one bullet per line, the goal sentence on its own line.
+        p = re.sub(r"\s*•\s*", "\n• ", p)
+        p = re.sub(r"\s+(The student wants)", r"\n\1", p)
+        return p.strip()
+    if p.startswith("Text 1"):
+        p = re.sub(r"\s+(Text 2\b)", r"\n\n\1", p, count=1)
+    return p
 
-def build_rw(test, main, ans):
+FIG_ZOOM = 2.6
+
+
+def figure_boxes(doc, pi, r):
+    """Rects of tables/graphs/images inside clip r: anything drawn besides the
+    grey header bar / label box and single thin underline strokes."""
+    page = doc[pi]
+    out = [fitz.Rect(i["bbox"]) for i in page.get_image_info()
+           if fitz.Rect(i["bbox"]).intersects(r)]
+    for d in page.get_drawings():
+        dr = d["rect"]
+        if not dr.intersects(r) or (d.get("fill") and dr.height < 20):
+            continue
+        underline = len(d["items"]) == 1 and dr.height < 1 and (d.get("width") or 0) < 2
+        if not underline:
+            out.append(dr)
+    return out
+
+
+def has_figure(doc, pieces):
+    return any(figure_boxes(doc, pi, r) for pi, r in pieces)
+
+
+def first_choice_y(doc):
+    def stop(pi, r):
+        ys = [w[1] for w in doc[pi].get_text("words", clip=r) if w[4] == "A)"]
+        return min(ys) - 4 if ys else None
+    return stop
+
+
+def split_trailing_figure(doc, pieces):
+    """Some questions place their graph *below* the answer choices (in the same
+    column or the next one). Return (text_pieces, figure_pieces): the question
+    without that figure (so its labels don't leak into choice D) and the figure
+    region itself."""
+    def real(boxes, r):
+        # Ignore hairline strips (footer rules) hugging the bottom of a column.
+        return [bx for bx in boxes if bx.height > 4 and bx.y0 < r.y1 - 12]
+    for k, (pi, r) in enumerate(pieces):
+        dys = [w[3] for w in doc[pi].get_text("words", clip=r) if w[4] == "D)"]
+        if not dys:
+            continue
+        below = [bx for bx in real(figure_boxes(doc, pi, r), r) if bx.y0 > dys[0] + 2]
+        if below:
+            cut = min(bx.y0 for bx in below) - 6
+            text_p = pieces[:k] + [(pi, fitz.Rect(r.x0, r.y0, r.x1, cut))]
+            fig_p = [(pi, fitz.Rect(r.x0, cut, r.x1, r.y1))] + pieces[k + 1:]
+            return text_p, fig_p
+        rest = pieces[k + 1:]
+        if any(real(figure_boxes(doc, pj, rj), rj) for pj, rj in rest):
+            return pieces[:k + 1], rest
+        return pieces, []
+    return pieces, []
+
+
+def split_at_choices(doc, pieces):
+    """(stem_pieces, choice_pieces): split the question at its "A)" line."""
+    stop = first_choice_y(doc)
+    for k, (pi, r) in enumerate(pieces):
+        y = stop(pi, r)
+        if y is not None:
+            return (pieces[:k] + [(pi, fitz.Rect(r.x0, r.y0, r.x1, y))],
+                    [(pi, fitz.Rect(r.x0, y, r.x1, r.y1))] + pieces[k + 1:])
+    return pieces, []
+
+
+def question_text(flow, doc, pieces, sort):
+    """Stem and choices read from separate clips: a figure's hidden text can be
+    emitted after the choices in the content stream although it sits above
+    them, and would otherwise be glued onto choice D."""
+    stem, choices = split_at_choices(doc, pieces)
+    return flow.text(stem, sort=sort) + "\n" + flow.text(choices, sort=sort)
+
+
+def stimulus_images(test, outdir="assets/rw"):
+    """Crop the stimulus (label down to choice A, plus any figure placed below
+    the choices) of every R&W question that has a table/figure or whose
+    question sentence is missing from the text layer.
+    Returns {(module, N): image_path}."""
+    import layout as L
+    doc = fitz.open(f"{PDF_DIR}/sat-practice-test-{test}-digital.pdf")
+    out = {}
+    for mod in (1, 2):
+        flow = L.ModuleFlow(doc, "rw", mod)
+        for N in flow.numbers():
+            stem = flow.pieces(N, stop_y=first_choice_y(doc))
+            if not stem:
+                continue
+            _, fig = split_trailing_figure(doc, flow.pieces(N))
+            # Also image the stem when its question sentence isn't in the text
+            # layer (drawn as graphics, e.g. test 7 R&W Q1).
+            no_prompt = "?" not in flow.text(stem)
+            if not (no_prompt or fig or has_figure(doc, stem)):
+                continue
+            img = flow.render(stem + fig, FIG_ZOOM)
+            if img is None:
+                continue
+            fname = f"t{test}-rw{mod}-{N}.png"
+            img.save(os.path.join(outdir, fname))
+            out[(mod, N)] = f"assets/rw/{fname}"
+    return out
+
+
+
+def reset_dir(d):
+    """Empty d of PNGs (stale/orphan crops must never ship). Deletes files one by
+    one rather than the folder, which survives a viewer holding it open."""
+    os.makedirs(d, exist_ok=True)
+    for f in os.listdir(d):
+        if f.lower().endswith(".png"):
+            os.remove(os.path.join(d, f))
+
+
+def build_rw(test, main, ans, figures):
     """Return (questions[], skipped_count)."""
     qs, skipped = [], 0
     for key in sorted(main):
@@ -337,8 +530,10 @@ def build_rw(test, main, ans):
             skipped += 1
             continue
         pa = m["passage"]
-        # Skip questions that depend on a figure we cannot render from text.
-        if re.search(r"\b(graph|chart|figure|bar graph)\b", pa.lower()) and "•" not in pa:
+        image = figures.get((mod, num))
+        # A question that refers to a figure we could not crop can't be shown.
+        if (not image and re.search(r"\b(graph|chart|figure|bar graph)\b", pa.lower())
+                and "•" not in pa):
             skipped += 1
             continue
         skill = infer_skill(m["prompt"], pa, m["choices"])
@@ -353,11 +548,12 @@ def build_rw(test, main, ans):
             "id": f"t{test}-rw{mod}-{num}",
             "skill": skill, "difficulty": 2, "type": "mc",
             "passage": clean_passage(pa),
-            "prompt": " ".join(m["prompt"].split()),
+            "prompt": clean_passage(m["prompt"]),
             "choices": choices,
             "answer": LETTER_IDX[a["letter"]],
             "rationales": rationales,
             "exam": f"Practice Test {test}",
+            "image": image,
         })
     return qs, skipped
 
@@ -368,12 +564,15 @@ def js_string(s):
 if __name__ == "__main__":
     from collections import Counter
     tests = ["4", "5", "6", "7", "8", "9", "10", "11"]
+    import shutil
+    reset_dir("assets/rw")
     all_q = []
     total_skipped = 0
     for t in tests:
         main = parse_main(f"{PDF_DIR}/sat-practice-test-{t}-digital.pdf")
         ans = parse_answers(f"{PDF_DIR}/sat-practice-test-{t}-answers-digital.pdf")
-        qs, skipped = build_rw(t, main, ans)
+        figures = stimulus_images(t)
+        qs, skipped = build_rw(t, main, ans, figures)
         all_q.extend(qs)
         total_skipped += skipped
         print(f"Test {t}: {len(qs)} R&W questions kept, {skipped} skipped")
@@ -397,6 +596,8 @@ if __name__ == "__main__":
         lines.append("    {")
         lines.append(f"      id: {js_string(q['id'])}, skill: {js_string(q['skill'])}, difficulty: {q['difficulty']}, type: \"mc\",")
         lines.append(f"      exam: {js_string(q['exam'])},")
+        if q.get("image"):
+            lines.append(f"      image: {js_string(q['image'])},")
         lines.append(f"      passage: {js_string(q['passage'])},")
         lines.append(f"      prompt: {js_string(q['prompt'])},")
         lines.append(f"      choices: {json.dumps(q['choices'], ensure_ascii=False)},")

@@ -282,6 +282,8 @@ header.app .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
 .spr input:focus { outline: none; border-color: var(--accent); }
 .spr input:disabled { opacity: 0.7; }
 .spr-hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+.spr-hint.warn { color: var(--warn); }
+.passage u { text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .spr-note { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
 
 /* Image-based (Math) questions: crop shown as image, A-D letter buttons */

@@ -4,3 +4,5 @@ dist/
 work/txt/
 work/*.json
 .DS_Store
+__pycache__/
+pdfs/
